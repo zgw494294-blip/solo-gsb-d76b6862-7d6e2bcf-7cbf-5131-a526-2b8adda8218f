@@ -834,3 +834,256 @@ def locate_single_leak(case: LeakCase) -> dict[str, Any]:
         "leak_node": leak_node,
         "conclusion": conclusion,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 停供节点分组复供规划
+# --------------------------------------------------------------------------- #
+MIN_SHUTDOWN_NODES, MAX_SHUTDOWN_NODES = 2, 6
+
+
+@dataclass(frozen=True)
+class RestorationCase:
+    """一次停供节点分组复供规划的全部输入。"""
+    network: Network
+    # 候选停供节点编号，按节点录入顺序排列；每个节点的表内需水量为正
+    shutdown_nodes: list[str]
+
+
+def validate_restore_payload(payload: Any) -> RestorationCase:
+    """在校验管网的基础上追加校验“停供节点”列表，返回规范化 RestorationCase。"""
+    net = validate_payload(payload)
+    demand_demands = {n["id"]: n["demand"]
+                      for n in net.nodes if n["type"] == "demand"}
+
+    raw_nodes = payload.get("shutdown_nodes")
+    if not isinstance(raw_nodes, list):
+        raise ValidationError("shutdown_nodes 必须是停供用水节点编号数组。")
+    if not (MIN_SHUTDOWN_NODES <= len(raw_nodes) <= MAX_SHUTDOWN_NODES):
+        raise ValidationError(
+            f"停供复供节点必须在 {MIN_SHUTDOWN_NODES}～{MAX_SHUTDOWN_NODES} 个之间，"
+            f"当前为 {len(raw_nodes)} 个。")
+
+    shutdown: list[str] = []
+    seen: set[str] = set()
+    for k, raw in enumerate(raw_nodes, start=1):
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValidationError(f"第 {k} 个停供节点缺少有效的节点编号（非空字符串）。")
+        nid = raw.strip()
+        if nid in seen:
+            raise ValidationError(f"停供节点“{nid}”重复，所有停供节点必须互异。")
+        if nid not in demand_demands:
+            raise ValidationError(
+                f"停供节点“{nid}”不是已定义的用水节点"
+                f"（停供节点必须全部为用水节点）。")
+        if demand_demands[nid] <= 0.0:
+            raise ValidationError(
+                f"用水节点“{nid}”的表内需水量必须为正数才能作为停供复供节点，"
+                f"当前为 {demand_demands[nid]:g}。")
+        seen.add(nid)
+        shutdown.append(nid)
+
+    # 统一按节点录入顺序排列，作为“节点录入顺序字典序”的比较基准
+    shutdown.sort(key=lambda nid: next(i for i, n in enumerate(net.nodes)
+                                       if n["id"] == nid))
+    return RestorationCase(network=net, shutdown_nodes=shutdown)
+
+
+def _network_with_demands(net: Network, override: dict[str, float]) -> Network:
+    """把 override 中用水节点的需水量替换为给定值，其余节点与管段不变。"""
+    nodes: list[dict[str, Any]] = []
+    for node in net.nodes:
+        if node["type"] == "demand" and node["id"] in override:
+            bumped = dict(node)
+            bumped["demand"] = float(override[node["id"]])
+            nodes.append(bumped)
+        else:
+            nodes.append(node)
+    return Network(nodes=nodes, pipes=net.pipes, min_head=net.min_head)
+
+
+def plan_supply_restoration(case: RestorationCase) -> dict[str, Any]:
+    """枚举停供节点的全部复供组合（含空集），给出恢复需水量最大的可同时复供组合。
+
+    复供前基线：所有候选停供节点一律按零需水量计算，其余节点保持表内参数不变；
+    某个组合中被选中的节点恢复其表内需水量，未选中者继续按零需水。每个组合都
+    重新做稳态求解，并要求所有用水节点水头均不低于现有最低水头限值。
+
+    结论分三种：
+      * optimal                  —— 基线合格且全部组合收敛，最优组合已确认；
+      * baseline_below_min_head  —— 基线本身欠压（空集即不合格），无法复供；
+      * indeterminate            —— 基线或任一组合不收敛，无法确认最优
+                                    （求解失败不能当作欠压）。
+
+    组合优选规则：恢复需水量总和最大者优先；总量相同先选节点数更多的；再相同按
+    节点录入顺序的字典序（候选节点按录入顺序编号后，比较下标元组的字典序）。
+    """
+    net = case.network
+    candidates = list(case.shutdown_nodes)  # 已按节点录入顺序
+    k = len(candidates)
+    table_demand = {n["id"]: n["demand"]
+                    for n in net.nodes if n["type"] == "demand"}
+    demand_ids = list(table_demand)
+    shutdown_demand = {nid: float(table_demand[nid]) for nid in candidates}
+
+    # ---- 复供前基线：候选节点全部按零需水 -------------------------------
+    zero_net = _network_with_demands(net, {nid: 0.0 for nid in candidates})
+    baseline: dict[str, Any] | None = None
+    baseline_error: str | None = None
+    try:
+        baseline = solve_network(zero_net)
+    except SolverNotConverged as exc:
+        baseline_error = str(exc)
+
+    baseline_below: list[str] = []
+    if baseline is not None:
+        baseline_below = list(baseline["below_min_head"])
+
+    # ---- 枚举全部 2^k 个组合（掩码 0 即空集，直接复用基线解） ------------
+    combinations: list[dict[str, Any]] = []
+    for mask in range(1 << k):
+        restored = [candidates[j] for j in range(k) if (mask >> j) & 1]
+        index_tuple = tuple(j for j in range(k) if (mask >> j) & 1)
+        restored_total = float(sum(shutdown_demand[nid] for nid in restored))
+        entry: dict[str, Any] = {
+            "combination_index": mask,
+            "restored_nodes": restored,
+            "restored_node_count": len(restored),
+            "restored_demand": restored_total,
+            "_index_tuple": index_tuple,
+        }
+
+        if mask == 0:
+            result, error = baseline, baseline_error
+        else:
+            # 选中的恢复表内需水量，未选中的候选继续按零需水
+            override = {nid: 0.0 for nid in candidates if nid not in restored}
+            try:
+                result = solve_network(_network_with_demands(net, override))
+                error = None
+            except SolverNotConverged as exc:
+                result, error = None, str(exc)
+
+        if result is None:
+            entry.update({"status": "not_converged", "error": error})
+        else:
+            heads = result["heads"]
+            below = result["below_min_head"]
+            entry.update({
+                "status": "feasible" if not below else "below_min_head",
+                "below_min_head": below,
+                "min_demand_head": float(min(heads[nid] for nid in demand_ids)),
+                # 水头并列时 min 取录入顺序的第一个节点
+                "min_demand_head_node": min(demand_ids, key=lambda nid: heads[nid]),
+                "source_supply": result["source_supply"],
+                "total_demand": result["total_demand"],
+                "solution": result,
+            })
+        combinations.append(entry)
+
+    # 排序：可行在前（按恢复量降序、节点数降序、录入字典序），欠压居中，
+    # 不收敛最后；组内同分保持原掩码顺序。
+    def combo_sort_key(c: dict[str, Any]) -> tuple[int, float, int, tuple[int, ...]]:
+        group = {"feasible": 0, "below_min_head": 1, "not_converged": 2}[c["status"]]
+        return (group, -c["restored_demand"], -c["restored_node_count"],
+                c["_index_tuple"])
+
+    combinations.sort(key=combo_sort_key)
+    for rank, c in enumerate(combinations, start=1):
+        c["rank"] = rank
+
+    counts = {"feasible": 0, "below_min_head": 0, "not_converged": 0}
+    for c in combinations:
+        counts[c["status"]] += 1
+
+    feasible = [c for c in combinations if c["status"] == "feasible"]
+    # 空集恰好等于基线：基线合格时空集必可行，故基线合格时 feasible 非空
+    baseline_ok = baseline is not None and not baseline_below
+
+    selection: dict[str, Any] | None = None
+    if baseline_ok:
+        best = feasible[0]
+        not_restored = [nid for nid in candidates
+                        if nid not in best["restored_nodes"]]
+        selection = {
+            "restored_nodes": best["restored_nodes"],
+            "restored_node_count": best["restored_node_count"],
+            "restored_demand": best["restored_demand"],
+            "not_restored_nodes": not_restored,
+            "min_demand_head": best["min_demand_head"],
+            "min_demand_head_node": best["min_demand_head_node"],
+            "below_min_head": best["below_min_head"],
+            "source_supply": best["source_supply"],
+            "total_demand": best["total_demand"],
+            "solution": best["solution"],
+            "combination_index": best["combination_index"],
+        }
+
+    if baseline is None:
+        status = "indeterminate"
+        optimum_confirmed = False
+        conclusion = (
+            "复供前基线（停供节点全部按零需水）的稳态求解未能收敛，"
+            f"无法确认最优复供组合（{baseline_error}）。"
+            "求解失败不能当作欠压，请检查参数数量级后重试。")
+    elif baseline_below:
+        status = "baseline_below_min_head"
+        optimum_confirmed = False
+        conclusion = (
+            "复供前基线已有用水节点水头低于最低水头限值 "
+            f"{net.min_head:g}（" + "、".join(baseline_below) + "），"
+            "在基线欠压的情况下无法执行复供规划；请先解决基线欠压问题。")
+    elif counts["not_converged"]:
+        status = "indeterminate"
+        optimum_confirmed = False
+        failed = [c for c in combinations if c["status"] == "not_converged"]
+        chosen_text = ("节点 " + "、".join(selection["restored_nodes"])
+                       if selection["restored_nodes"]
+                       else "空集（不恢复任何停供节点）")
+        conclusion = (
+            "基线合格；在所有收敛成功的组合中，当前恢复需水量最大的可复供组合为"
+            + chosen_text + f"，恢复需水量合计 {selection['restored_demand']:g}；"
+            f"但另有 {len(failed)} 个组合稳态不收敛，无法确认该选择是否为全局最优"
+            "（求解失败不能当作欠压）。")
+    else:
+        status = "optimal"
+        optimum_confirmed = True
+        if selection["restored_nodes"]:
+            conclusion = (
+                "可同时复供的最优组合为节点 "
+                + "、".join(selection["restored_nodes"])
+                + f"，恢复需水量合计 {selection['restored_demand']:g}"
+                + (("；未复供节点 " + "、".join(selection["not_restored_nodes"]))
+                   if selection["not_restored_nodes"] else "（全部停供节点均复供）")
+                + f"。复供后最低用水节点水头为 {selection['min_demand_head']:.6g}"
+                f"（节点 {selection['min_demand_head_node']}，限值 "
+                f"{net.min_head:g}）。")
+        else:
+            conclusion = (
+                "复供前基线已满足最低水头限值，但任何非空复供组合都会使用水节点"
+                "水头跌破限值；最优方案为空集，即不恢复任何停供节点"
+                "（恢复需水量合计 0）。")
+
+    for c in combinations:
+        c.pop("_index_tuple", None)
+
+    return {
+        "status": status,
+        "optimum_confirmed": optimum_confirmed,
+        "min_head": net.min_head,
+        "shutdown_nodes": [
+            {"id": nid, "demand": shutdown_demand[nid]} for nid in candidates],
+        "baseline_status": "converged" if baseline is not None else "not_converged",
+        "baseline": baseline,
+        "baseline_error": baseline_error,
+        "baseline_below_min_head": baseline_below,
+        "selection": selection,
+        "restored_nodes": None if selection is None else selection["restored_nodes"],
+        "restored_demand": (None if selection is None
+                            else selection["restored_demand"]),
+        "not_restored_nodes": (None if selection is None
+                               else selection["not_restored_nodes"]),
+        "counts": counts,
+        "combinations": combinations,
+        "conclusion": conclusion,
+    }

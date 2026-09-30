@@ -82,6 +82,7 @@ H_i − H_j = r_p · q_p · |q_p|
 | `POST` | `/api/solve` | 入参 `{nodes, pipes, min_head}`，返回水头、流量、流向、供水量与各项残差；非法输入返回 `422`/`400` 与中文原因 |
 | `POST` | `/api/analyze-outages` | 入参与 `/api/solve` 相同；先求基线，再对每根管段各评估一个“单独停用”情景并按风险排序返回 |
 | `POST` | `/api/locate-leak` | 入参为管网参数 + `measurements`（2～8 个互异用水节点的实测水头）+ 正的 `leak_upper_bound`；逐用水节点拟合单点漏量并按测点误差排序 |
+| `POST` | `/api/restore-supply` | 入参为管网参数 + `shutdown_nodes`（2～6 个互异、表内需水量为正的停供用水节点）；先求零需水基线，再枚举含空集在内的全部复供组合，返回恢复需水量最大的可同时复供组合 |
 | `GET` | `/api/health` | 健康检查 |
 
 请求示例：
@@ -249,6 +250,135 @@ curl -s http://localhost:8000/api/locate-leak \
 非法输入（测点数不在 2～8、测点重复或不是用水节点、实测水头/上限非有限值、上限非正、
 原有管网校验未通过等）返回 `422`/`400` 并附中文原因。
 
+### 停供节点分组复供 `POST /api/restore-supply`
+
+> 分组复供与求解共用同一服务、同一端口，**不需要任何额外服务或新的启动步骤**——
+> `docker compose up --build` 后即可直接调用。
+
+在管网参数（与 `/api/solve` 完全一致，沿用同一套输入校验）之外，请求体还需包含：
+
+- `shutdown_nodes`：**2～6 个互异**的停供用水节点编号（字符串数组）；
+  这些节点**表内必须有正的需水量**（`demand > 0`），水源节点、零需水节点、
+  未定义节点、重复编号一律拒绝。
+
+后端按以下步骤计算：
+
+1. **复供前基线**：把 `shutdown_nodes` 中所有节点的需水量**暂时按零**计算
+   （其他节点完全不变），先求一次稳态；
+2. **枚举全部 2^k 个组合（包含空集）**：组合中被选中的节点**恢复表内需水量**，
+   未选中的继续按零需水，其余节点始终不变；每个组合都重新做稳态求解；
+3. 只有**稳态收敛且所有用水节点水头均不低于现有最低水头限值**的组合才可选；
+4. 返回**恢复需水量总和最大**的组合；总量相同时先选**节点数更多**的，再相同则按
+   **节点录入顺序的字典序**（候选节点按节点表录入顺序编号，比较其下标元组的字典序；
+   请求里 `shutdown_nodes` 的排列顺序不影响结果）。
+
+三种结论状态（响应中的 `restoration.status`）：
+
+- `optimal`：基线合格且全部组合收敛，最优组合已确认（`optimum_confirmed=true`）；
+  若任何非空组合都会欠压，则最优组合就是**空集**（恢复总量 0，全部节点列为未复供）；
+- `baseline_below_min_head`：**复供前基线本身已有节点欠压**，说明在现有管网上
+  无法执行复供规划，`selection` 为 `null` 并在 `conclusion` 中说明**无法复供**；
+- `indeterminate`：**基线或任一组合稳态不收敛**，此时无法确认最优，
+  `optimum_confirmed=false`——求解失败**不会**被当作欠压：若基线本身合格，
+  仍给出“已收敛组合中恢复量最大”的临时选择（`selection`）并在结论文字中标明
+  它只是暂定值；基线不收敛时 `selection` 为 `null`。
+
+响应 `restoration` 含：
+
+- `baseline` / `baseline_status` / `baseline_below_min_head`：复供前基线稳态解
+  （结构与 `/api/solve` 的 `result` 相同）、收敛状态与基线欠压节点；基线不收敛时
+  另有 `baseline_error`（中文原因）；
+- `shutdown_nodes`：候选停供节点及其表内需水量（按节点录入顺序）；
+- `selection`：最优（或暂定为最优）组合——`restored_nodes`（本次复供节点）、
+  `not_restored_nodes`（未复供节点）、`restored_demand`（恢复需水量总和）、
+  `min_demand_head` / `min_demand_head_node`、`solution`（该组合的完整稳态解）；
+  无法选择时为 `null`；顶层另有同名字段 `restored_nodes` / `restored_demand` /
+  `not_restored_nodes` 便于直接取用；
+- `combinations`：全部 2^k 个组合，每个含 `rank`、`status`
+  （`feasible` / `below_min_head` / `not_converged`）、`restored_nodes`、
+  `restored_demand`、`restored_node_count`、最低水头与完整 `solution`
+  （不收敛组合改给 `error`）；排序为可行组合在前（按恢复量降序、节点数降序、
+  录入字典序），欠压组合居中，不收敛组合最后；
+- `counts`：三类组合的数量；`conclusion`：中文结论文字。
+
+curl 调用示例（枝状网 `S—A—B—C`，三个用水节点当前停供）：
+
+```bash
+curl -s http://localhost:8000/api/restore-supply \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "min_head": 0,
+    "nodes": [
+      {"id": "S", "type": "source", "head": 50.0},
+      {"id": "A", "type": "demand", "demand": 2.0},
+      {"id": "B", "type": "demand", "demand": 3.0},
+      {"id": "C", "type": "demand", "demand": 6.0}
+    ],
+    "pipes": [
+      {"id": "P1", "start": "S", "end": "A", "r": 1.0},
+      {"id": "P2", "start": "A", "end": "B", "r": 1.0},
+      {"id": "P3", "start": "B", "end": "C", "r": 1.0}
+    ],
+    "shutdown_nodes": ["A", "B", "C"]
+  }'
+```
+
+返回（节选）：复供 A、B（共 5）后最低水头仍有 16 ≥ 0；再带上 C（共 11）则
+末端水头为 −188 跌破限值，故最优组合为 `{A, B}`、未复供节点为 C：
+
+```json
+{
+  "ok": true,
+  "restoration": {
+    "status": "optimal",
+    "optimum_confirmed": true,
+    "min_head": 0.0,
+    "shutdown_nodes": [
+      {"id": "A", "demand": 2.0},
+      {"id": "B", "demand": 3.0},
+      {"id": "C", "demand": 6.0}
+    ],
+    "restored_nodes": ["A", "B"],
+    "not_restored_nodes": ["C"],
+    "restored_demand": 5.0,
+    "baseline_below_min_head": [],
+    "counts": {"feasible": 4, "below_min_head": 4, "not_converged": 0},
+    "selection": {
+      "restored_nodes": ["A", "B"],
+      "restored_node_count": 2,
+      "restored_demand": 5.0,
+      "not_restored_nodes": ["C"],
+      "min_demand_head": 16.0,
+      "min_demand_head_node": "B",
+      "solution": {"heads": {"S": 50.0, "A": 25.0, "B": 16.0, "C": 16.0}}
+    },
+    "combinations": [
+      {"rank": 1, "status": "feasible", "restored_nodes": ["A", "B"],
+       "restored_demand": 5.0, "min_demand_head": 16.0},
+      {"rank": 2, "status": "feasible", "restored_nodes": ["B"],
+       "restored_demand": 3.0, "min_demand_head": 32.0},
+      {"rank": 3, "status": "feasible", "restored_nodes": ["A"],
+       "restored_demand": 2.0, "min_demand_head": 46.0},
+      {"rank": 4, "status": "feasible", "restored_nodes": [],
+       "restored_demand": 0.0, "min_demand_head": 50.0},
+      {"rank": 5, "status": "below_min_head", "restored_nodes": ["A", "B", "C"],
+       "restored_demand": 11.0, "min_demand_head": -188.0},
+      {"rank": 6, "status": "below_min_head", "restored_nodes": ["B", "C"],
+       "restored_demand": 9.0, "min_demand_head": -148.0},
+      {"rank": 7, "status": "below_min_head", "restored_nodes": ["A", "C"],
+       "restored_demand": 8.0, "min_demand_head": -86.0},
+      {"rank": 8, "status": "below_min_head", "restored_nodes": ["C"],
+       "restored_demand": 6.0, "min_demand_head": -58.0}
+    ],
+    "conclusion": "可同时复供的最优组合为节点 A、B，恢复需水量合计 5；未复供节点 C。复供后最低用水节点水头为 16（节点 B，限值 0）。"
+  }
+}
+```
+
+非法输入（停供节点数不在 2～6、编号重复、不是用水节点、表内需水量非正、
+原有管网校验未通过等）返回 `422`/`400` 并附中文原因；
+基线或组合不收敛属于分析结果，仍返回 `200`，在 `status` 中体现。
+
 ## 输入约束汇总
 
 - 节点 2～10 个，编号为非空且唯一的字符串；
@@ -257,15 +387,17 @@ curl -s http://localhost:8000/api/locate-leak \
 - 管网必须是**无向连通图**（孤立节点/孤岛一律拒绝）；
 - 不接受 `NaN` / `Infinity`（含 JSON 文本中的 `NaN`/`Infinity` 记号）；
 - 仅 `/api/locate-leak` 额外要求：`measurements` 为 2～8 个测点，节点编号互异且均为
-  用水节点，实测水头为有限数值；`leak_upper_bound` 为正有限数。
+  用水节点，实测水头为有限数值；`leak_upper_bound` 为正有限数；
+- 仅 `/api/restore-supply` 额外要求：`shutdown_nodes` 为 2～6 个互异节点编号，
+  全部为**表内需水量为正**的用水节点；复供前这些节点按零需水求基线，复供后才恢复表内值。
 
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py            # FastAPI 入口：/api/solve、/api/analyze-outages、/api/locate-leak、/api/health、静态页面
-│   ├── solver.py          # 输入校验 + Newton 稳态求解 + 1e-6 复核 + 逐根停管情景分析 + 单点漏损定位（黄金分割）
+│   ├── main.py            # FastAPI 入口：/api/solve、/api/analyze-outages、/api/locate-leak、/api/restore-supply、/api/health、静态页面
+│   ├── solver.py          # 输入校验 + Newton 稳态求解 + 1e-6 复核 + 逐根停管情景分析 + 单点漏损定位（黄金分割）+ 停供分组复供枚举
 │   └── static/
 │       ├── index.html     # 原生页面（含停管分析入口与结果表）
 │       ├── style.css
@@ -283,4 +415,4 @@ pip install -r requirements.txt pytest httpx
 PYTHONPATH=. pytest -q
 ```
 
-测试包含单管解析解、反向录入符号、环状网独立复核、低水头标记、各类非法输入、`NaN` JSON 拒绝，以及 60 个随机连通管网（2～10 节点、最多 16 管、阻力跨 6 个数量级）的收敛性与残差检查；停管分析部分覆盖树状网全断联按失供量排序、环+枝混合分组排序、比基线新增低水头节点、同分保持录入顺序、单情景不收敛单独排最后，以及 `/api/analyze-outages` 的 200/422/400 分支；漏损定位部分覆盖真值漏点与漏量回收、无漏损基线 RMSE=0 不判漏、对称网络多候选无法区分、最优漏量落在上限端点、测点/上限各类非法输入、基线不收敛整体报错、单候选失败隔离排最后，以及 `/api/locate-leak` 的 200/422/400 分支。
+测试包含单管解析解、反向录入符号、环状网独立复核、低水头标记、各类非法输入、`NaN` JSON 拒绝，以及 60 个随机连通管网（2～10 节点、最多 16 管、阻力跨 6 个数量级）的收敛性与残差检查；停管分析部分覆盖树状网全断联按失供量排序、环+枝混合分组排序、比基线新增低水头节点、同分保持录入顺序、单情景不收敛单独排最后，以及 `/api/analyze-outages` 的 200/422/400 分支；漏损定位部分覆盖真值漏点与漏量回收、无漏损基线 RMSE=0 不判漏、对称网络多候选无法区分、最优漏量落在上限端点、测点/上限各类非法输入、基线不收敛整体报错、单候选失败隔离排最后，以及 `/api/locate-leak` 的 200/422/400 分支；分组复供部分覆盖零需水基线（含非候选节点保持表内需水）、恢复总量最大组合与未复供节点、仅空集可行、基线欠压拒绝复供、恢复总量同分先选节点更多、再同分按节点录入顺序字典序（含重排节点与打乱提交顺序）、全部 2^k 组合枚举、停供节点各类非法输入、基线/单组合不收敛标为无法确认最优且不误判欠压，以及 `/api/restore-supply` 的 200/422/400 分支。

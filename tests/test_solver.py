@@ -15,9 +15,11 @@ from app.solver import (
     ValidationError,
     analyze_pipe_outages,
     locate_single_leak,
+    plan_supply_restoration,
     solve_network,
     validate_leak_payload,
     validate_payload,
+    validate_restore_payload,
 )
 
 client = TestClient(app)
@@ -782,3 +784,397 @@ def test_api_locate_leak_baseline_nonconvergence_422(monkeypatch):
     resp = client.post("/api/locate-leak", json=p)
     assert resp.status_code == 422
     assert "基线" in resp.json()["error"]
+
+
+# ---------------------------- 停供节点分组复供 ---------------------------- #
+def _series_restore_payload():
+    """枝状串联网：S --P1-- A(2) --P2-- B(3) --P3-- C(6)，三个候选均处于停供。
+
+    单管压降 r·q|q|、min_head=0 时：
+      复供 {A,B}：H_J 最低为 B，H_B = 50 - 25 - 9 = 16 ≥ 0，恢复量 5；
+      再加 C（总量 11）后 H_C = -188 < 0，故 {A,B,C} 欠压；
+      含 C 的各组合（{C}=6、{A,C}=8、{B,C}=9）最低水头均为负。
+    """
+    return {
+        "nodes": [
+            {"id": "S", "type": "source", "head": 50.0},
+            {"id": "A", "type": "demand", "demand": 2.0},
+            {"id": "B", "type": "demand", "demand": 3.0},
+            {"id": "C", "type": "demand", "demand": 6.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "A", "r": 1.0},
+            {"id": "P2", "start": "A", "end": "B", "r": 1.0},
+            {"id": "P3", "start": "B", "end": "C", "r": 1.0},
+        ],
+        "min_head": 0.0,
+        "shutdown_nodes": ["A", "B", "C"],
+    }
+
+
+def test_restore_baseline_treats_shutdown_as_zero_demand():
+    """复供前基线：候选节点全部按零需水，各点水头等于水源水头、供水量为 0。"""
+    a = plan_supply_restoration(validate_restore_payload(_series_restore_payload()))
+    base = a["baseline"]
+    assert base["converged"] is True
+    assert base["total_demand"] == pytest.approx(0.0, abs=1e-12)
+    assert base["source_supply"] == pytest.approx(0.0, abs=1e-12)
+    assert set(base["heads"]) == {"S", "A", "B", "C"}
+    assert all(base["heads"][nid] == pytest.approx(50.0, abs=1e-12)
+               for nid in ("A", "B", "C"))
+    assert a["baseline_status"] == "converged"
+    assert a["baseline_below_min_head"] == []
+    # 空集组合直接复用基线，恢复量为 0
+    empty = next(c for c in a["combinations"] if not c["restored_nodes"])
+    assert empty["restored_demand"] == 0.0
+    assert empty["status"] == "feasible"
+
+
+def test_restore_picks_max_total_and_lists_not_restored():
+    """最优组合恢复总量最大（{A,B}=5），未复供节点 C 单独列出。"""
+    a = plan_supply_restoration(validate_restore_payload(_series_restore_payload()))
+    assert a["status"] == "optimal"
+    assert a["optimum_confirmed"] is True
+    assert a["restored_nodes"] == ["A", "B"]
+    assert a["not_restored_nodes"] == ["C"]
+    assert a["restored_demand"] == pytest.approx(5.0)
+    sel = a["selection"]
+    assert sel["restored_node_count"] == 2
+    assert sel["min_demand_head"] == pytest.approx(16.0, abs=1e-9)
+    assert sel["min_demand_head_node"] == "B"
+    # 对应稳态结果完整给出，且表内需水量已恢复
+    sol = sel["solution"]
+    assert sol["total_demand"] == pytest.approx(5.0)
+    assert sol["source_supply"] == pytest.approx(5.0, abs=1e-9)
+    assert sol["heads"]["B"] == pytest.approx(16.0, abs=1e-9)
+    assert sol["max_node_residual"] < CHECK_TOL
+    assert a["counts"] == {"feasible": 4, "below_min_head": 4, "not_converged": 0}
+    # 可行组合排名按恢复量降序；欠压与不收敛组在后
+    assert [c["rank"] for c in a["combinations"]] == list(range(1, 9))
+    first = a["combinations"][0]
+    assert first["restored_nodes"] == ["A", "B"] and first["status"] == "feasible"
+
+
+def test_restore_non_candidate_node_keeps_demand_in_baseline():
+    """非候选用水节点在基线（及各组合）中始终保持表内需水量，不被置零。"""
+    payload = {
+        "min_head": 0.0,
+        "nodes": [
+            {"id": "S", "type": "source", "head": 50.0},
+            {"id": "O", "type": "demand", "demand": 1.0},
+            {"id": "A", "type": "demand", "demand": 2.0},
+            {"id": "B", "type": "demand", "demand": 3.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "O", "r": 1.0},
+            {"id": "P2", "start": "O", "end": "A", "r": 1.0},
+            {"id": "P3", "start": "A", "end": "B", "r": 1.0},
+        ],
+        "shutdown_nodes": ["A", "B"],
+    }
+    a = plan_supply_restoration(validate_restore_payload(payload))
+    assert a["baseline"]["total_demand"] == pytest.approx(1.0)
+    assert a["baseline"]["heads"]["O"] == pytest.approx(49.0, abs=1e-9)
+    # 停供的 A、B 需水为零，其下游管段零流量，水头沿程等于 O 点水头
+    assert a["baseline"]["heads"]["B"] == pytest.approx(49.0, abs=1e-9)
+    for c in a["combinations"]:
+        if c["status"] != "not_converged":
+            assert c["solution"]["heads"]["O"] <= 50.0 + 1e-12
+    # {A,B}=5 时 O→A 管段承担 5 的流量，H_A=14-25<0 欠压；故最优为 {B}=3
+    assert a["restored_nodes"] == ["B"]
+    sel_heads = a["selection"]["solution"]["heads"]
+    # 仅复供 B（3）：O 点承担总量 1+3=4，H_O = 50 - 16 = 34
+    assert sel_heads["O"] == pytest.approx(34.0, abs=1e-9)
+    assert sel_heads["A"] == pytest.approx(25.0, abs=1e-9)  # 34 - 3²
+    assert sel_heads["B"] == pytest.approx(16.0, abs=1e-9)  # 25 - 3²
+
+
+def test_restore_empty_set_wins_when_every_nonempty_below_limit():
+    """所有非空组合都欠压时，最优为空集，恢复总量 0，全部节点列为未复供。"""
+    payload = {
+        "min_head": 29.5,
+        "nodes": [
+            {"id": "S", "type": "source", "head": 30.0},
+            {"id": "A", "type": "demand", "demand": 1.0},
+            {"id": "B", "type": "demand", "demand": 1.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "A", "r": 1.0},
+            {"id": "P2", "start": "A", "end": "B", "r": 1.0},
+        ],
+        "shutdown_nodes": ["A", "B"],
+    }
+    a = plan_supply_restoration(validate_restore_payload(payload))
+    assert a["status"] == "optimal"
+    assert a["restored_nodes"] == []
+    assert a["not_restored_nodes"] == ["A", "B"]
+    assert a["restored_demand"] == pytest.approx(0.0)
+    assert a["counts"] == {"feasible": 1, "below_min_head": 3, "not_converged": 0}
+    assert "空集" in a["conclusion"]
+
+
+def test_restore_baseline_below_min_head_blocks_restoration():
+    """基线（空集）已有用水节点欠压：无法复供，不给选择结果。"""
+    payload = {
+        "min_head": 20.0,
+        "nodes": [
+            {"id": "S", "type": "source", "head": 30.0},
+            # O 始终在线且独占一条高阻支路：H_O = 30 - 4² = 14 < 20，基线即欠压
+            {"id": "O", "type": "demand", "demand": 4.0},
+            {"id": "A", "type": "demand", "demand": 1.0},
+            {"id": "B", "type": "demand", "demand": 1.0},
+        ],
+        "pipes": [
+            {"id": "P1", "start": "S", "end": "O", "r": 1.0},
+            {"id": "P2", "start": "S", "end": "A", "r": 1.0},
+            {"id": "P3", "start": "A", "end": "B", "r": 1.0},
+        ],
+        "shutdown_nodes": ["A", "B"],
+    }
+    a = plan_supply_restoration(validate_restore_payload(payload))
+    assert a["status"] == "baseline_below_min_head"
+    assert a["optimum_confirmed"] is False
+    assert a["selection"] is None
+    assert a["restored_nodes"] is None
+    # 停供的 A、B 为零需水，水头等于水源 30 ≥ 20；只有始终在线的 O 欠压
+    assert a["baseline_below_min_head"] == ["O"]
+    assert a["counts"]["feasible"] == 0
+    assert "无法" in a["conclusion"]
+
+
+def _hub_payload(demands, r_shared, r_branch=0.001):
+    """星形网：S --r_shared-- J(0 需水) --r_branch-- 各候选，支路损失可忽略，
+    可行性近似仅由“恢复总量”经共用管的压降决定，便于构造精确同分。"""
+    ids = ["A", "B", "C", "D", "E", "F"]
+    nodes = [
+        {"id": "S", "type": "source", "head": 30.0},
+        {"id": "J", "type": "demand", "demand": 0.0},
+    ]
+    nodes += [{"id": ids[i], "type": "demand", "demand": float(d)}
+              for i, d in enumerate(demands)]
+    pipes = [{"id": "P0", "start": "S", "end": "J", "r": r_shared}]
+    pipes += [{"id": f"P{i + 1}", "start": "J", "end": ids[i], "r": r_branch}
+              for i in range(len(demands))]
+    return {
+        "nodes": nodes,
+        "pipes": pipes,
+        "min_head": 0.0,
+        "shutdown_nodes": ids[:len(demands)],
+    }
+
+
+def test_restore_same_total_prefers_more_nodes():
+    """恢复总量相同：先选节点更多的——{A,B}=5（2 个）胜过 {C}=5（1 个）。"""
+    a = plan_supply_restoration(validate_restore_payload(
+        _hub_payload([2.0, 3.0, 5.0], r_shared=0.8)))
+    assert a["status"] == "optimal"
+    assert a["restored_nodes"] == ["A", "B"]
+    assert a["restored_demand"] == pytest.approx(5.0)
+    assert a["not_restored_nodes"] == ["C"]
+    # {A,B} 与 {C} 同为可行且恢复量相同，排名上 {A,B} 在前
+    ranked = [(c["restored_nodes"], c["restored_demand"])
+              for c in a["combinations"] if c["status"] == "feasible"]
+    assert ranked[0] == (["A", "B"], 5.0)
+    assert (["C"], 5.0) in ranked[1:]
+
+
+def test_restore_same_total_and_size_uses_entry_order_lexicographic():
+    """恢复总量与节点数都相同：按下标元组字典序——{A,D}=(0,3) 先于 {B,C}=(1,2)。"""
+    a = plan_supply_restoration(validate_restore_payload(
+        _hub_payload([3.0, 2.0, 5.0, 4.0], r_shared=0.5)))
+    assert a["status"] == "optimal"
+    assert a["restored_nodes"] == ["A", "D"]
+    assert a["restored_demand"] == pytest.approx(7.0)
+    assert a["not_restored_nodes"] == ["B", "C"]
+    ranked = [(tuple(c["restored_nodes"]), c["restored_demand"])
+              for c in a["combinations"] if c["status"] == "feasible"]
+    assert ranked[0] == (("A", "D"), 7.0)
+    assert (("B", "C"), 7.0) in ranked[1:]
+
+
+def test_restore_lexicographic_uses_node_entry_order_not_submission_order():
+    """字典序基准是节点录入顺序：重排节点并打乱 shutdown_nodes 后，
+    录入更早的两个同分节点仍应胜出。"""
+    p = _hub_payload([3.0, 2.0, 5.0, 4.0], r_shared=0.5)
+    # 节点录入顺序变为 S, J, D, A, C, B；停供列表故意打乱提交
+    p["nodes"] = [p["nodes"][0], p["nodes"][1], p["nodes"][5], p["nodes"][2],
+                  p["nodes"][4], p["nodes"][3]]
+    p["shutdown_nodes"] = ["C", "A", "B", "D"]
+    case = validate_restore_payload(p)
+    assert case.shutdown_nodes == ["D", "A", "C", "B"]
+    a = plan_supply_restoration(case)
+    assert a["restored_nodes"] == ["D", "A"]
+    assert a["restored_demand"] == pytest.approx(7.0)
+
+
+def test_restore_enumerates_all_combinations_including_empty():
+    """k 个候选必须枚举 2^k 个组合（含空集），掩码与 rank 字段齐全。"""
+    a = plan_supply_restoration(validate_restore_payload(
+        _hub_payload([1.0, 1.0], r_shared=1.0)))
+    combos = a["combinations"]
+    assert len(combos) == 4
+    assert sorted(c["combination_index"] for c in combos) == [0, 1, 2, 3]
+    assert [c["rank"] for c in combos] == [1, 2, 3, 4]
+    # 各组合恢复量等于选中节点表内需水量之和
+    table = {s["id"]: s["demand"] for s in a["shutdown_nodes"]}
+    for c in combos:
+        assert c["restored_demand"] == pytest.approx(
+            sum(table[nid] for nid in c["restored_nodes"]))
+
+
+def test_restore_validation_rules():
+    """停供节点列表的各类非法输入都须被拒绝并给出中文原因。"""
+    def expect_error(mutate, fragment):
+        p = _series_restore_payload()
+        mutate(p)
+        with pytest.raises(ValidationError) as exc:
+            validate_restore_payload(p)
+        assert fragment in str(exc.value)
+
+    expect_error(lambda p: p.update(shutdown_nodes=["A"]), "2～6")
+    expect_error(lambda p: p.update(
+        shutdown_nodes=["A", "B", "C", "A", "B", "C", "A"]), "2～6")
+    expect_error(lambda p: p.update(shutdown_nodes="x"), "必须是")
+    expect_error(lambda p: p.update(shutdown_nodes=["A", "A", "B"]), "互异")
+    expect_error(lambda p: p.update(shutdown_nodes=["S", "A", "B"]), "用水节点")
+    expect_error(lambda p: p.update(shutdown_nodes=["A", "ZZ"]), "用水节点")
+    expect_error(lambda p: p.update(shutdown_nodes=[{"id": "A"}, "B", "C"]),
+                 "节点编号")
+
+    # 表内需水量非正（含 0）的用水节点不能作为停供复供节点
+    p = _series_restore_payload()
+    p["nodes"][1]["demand"] = 0.0
+    with pytest.raises(ValidationError, match="正数"):
+        validate_restore_payload(p)
+    # 原有管网校验沿用：缺 min_head 等情形照常 422
+    with pytest.raises(ValidationError):
+        validate_restore_payload({"nodes": p["nodes"], "pipes": p["pipes"],
+                                  "shutdown_nodes": ["A", "B", "C"]})
+
+
+def test_restore_baseline_nonconvergence_is_indeterminate(monkeypatch):
+    """基线不收敛：状态 indeterminate、selection 为空；不能当作欠压。"""
+    payload = _series_restore_payload()
+    real_solve = solve_network
+
+    def boom_baseline(net):
+        demands = {n["id"]: n["demand"]
+                   for n in net.nodes if n["type"] == "demand"}
+        if demands == {"A": 0.0, "B": 0.0, "C": 0.0}:
+            raise SolverNotConverged("模拟基线不收敛")
+        return real_solve(net)
+
+    monkeypatch.setattr("app.solver.solve_network", boom_baseline)
+    a = plan_supply_restoration(validate_restore_payload(payload))
+    assert a["status"] == "indeterminate"
+    assert a["optimum_confirmed"] is False
+    assert a["baseline_status"] == "not_converged"
+    assert a["baseline"] is None
+    assert "模拟基线不收敛" in a["baseline_error"]
+    assert a["selection"] is None
+    assert a["restored_nodes"] is None
+    # 其余组合仍照常枚举（求解失败不等于欠压：不含 not_converged 之外的欠压误判）
+    assert a["counts"]["not_converged"] >= 1
+    assert "不能当作欠压" in a["conclusion"]
+
+
+def test_restore_single_combo_nonconvergence_marks_indeterminate(monkeypatch):
+    """单个组合不收敛：标明 not_converged 排最后并给出已收敛组合中的临时最优，
+    但 optimum_confirmed=False，不能宣称全局最优。"""
+    payload = _series_restore_payload()
+    real_solve = solve_network
+    call = {"n": 0}
+
+    def selective(net):
+        call["n"] += 1
+        # 求解顺序：基线（掩码 0）→ 掩码 1..7；第 4 次 = 掩码 3 = {A,B}
+        if call["n"] == 4:
+            raise SolverNotConverged("模拟 AB 组合不收敛")
+        return real_solve(net)
+
+    monkeypatch.setattr("app.solver.solve_network", selective)
+    a = plan_supply_restoration(validate_restore_payload(payload))
+    assert a["status"] == "indeterminate"
+    assert a["optimum_confirmed"] is False
+    assert a["baseline_status"] == "converged"
+    # 已收敛组合中恢复量最大的可行组合（掩码 3 失败，{B}=3 成为临时最优）
+    assert a["restored_nodes"] == ["B"]
+    assert a["restored_demand"] == pytest.approx(3.0)
+    failed = [c for c in a["combinations"] if c["status"] == "not_converged"]
+    assert [c["restored_nodes"] for c in failed] == [["A", "B"]]
+    assert "模拟 AB 组合不收敛" in failed[0]["error"]
+    assert failed[0]["rank"] == 8  # 不收敛组合一律排最后
+    assert a["counts"] == {"feasible": 3, "below_min_head": 4, "not_converged": 1}
+    assert "不能当作欠压" in a["conclusion"]
+
+
+# ---------------------------- 分组复供 API ---------------------------- #
+def test_api_restore_supply_ok():
+    resp = client.post("/api/restore-supply", json=_series_restore_payload())
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    a = data["restoration"]
+    assert a["status"] == "optimal"
+    assert a["restored_nodes"] == ["A", "B"]
+    assert a["not_restored_nodes"] == ["C"]
+    assert a["restored_demand"] == pytest.approx(5.0)
+    assert a["baseline"]["converged"] is True
+    assert len(a["combinations"]) == 8
+    assert [s["id"] for s in a["shutdown_nodes"]] == ["A", "B", "C"]
+
+
+def test_api_restore_supply_validation_error():
+    p = _series_restore_payload()
+    p["shutdown_nodes"] = ["A"]
+    resp = client.post("/api/restore-supply", json=p)
+    assert resp.status_code == 422
+    assert "2～6" in resp.json()["error"]
+
+
+def test_api_restore_supply_network_validation_error():
+    p = _series_restore_payload()
+    p["pipes"][0]["r"] = 0
+    resp = client.post("/api/restore-supply", json=p)
+    assert resp.status_code == 422
+    assert "阻力" in resp.json()["error"]
+
+
+def test_api_restore_supply_empty_body():
+    resp = client.post("/api/restore-supply", content=b"",
+                       headers={"Content-Type": "application/json"})
+    assert resp.status_code == 400
+
+
+def test_api_restore_supply_indeterminate_200(monkeypatch):
+    """基线不收敛是“无法确认最优”的分析结果，不是请求错误：HTTP 200。"""
+    import app.solver as solver_mod
+
+    real_solve = solver_mod.solve_network
+
+    def boom(net):
+        demands = {n["id"]: n["demand"]
+                   for n in net.nodes if n["type"] == "demand"}
+        if demands == {"A": 0.0, "B": 0.0, "C": 0.0}:
+            raise SolverNotConverged("模拟基线不收敛")
+        return real_solve(net)
+
+    monkeypatch.setattr(solver_mod, "solve_network", boom)
+    resp = client.post("/api/restore-supply", json=_series_restore_payload())
+    assert resp.status_code == 200
+    a = resp.json()["restoration"]
+    assert a["status"] == "indeterminate"
+    assert a["baseline_status"] == "not_converged"
+
+
+def test_api_restore_supply_rejects_nan_token():
+    body = ('{"nodes":[{"id":"S","type":"source","head":NaN},'
+            '{"id":"A","type":"demand","demand":1},'
+            '{"id":"B","type":"demand","demand":1}],'
+            '"pipes":[{"id":"P1","start":"S","end":"A","r":1},'
+            '{"id":"P2","start":"A","end":"B","r":1}],'
+            '"min_head":0,"shutdown_nodes":["A","B"]}')
+    resp = client.post("/api/restore-supply", content=body,
+                       headers={"Content-Type": "application/json"})
+    assert resp.status_code == 400
+    assert "JSON" in resp.json()["error"]

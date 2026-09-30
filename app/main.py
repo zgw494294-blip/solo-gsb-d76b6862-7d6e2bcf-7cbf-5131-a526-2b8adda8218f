@@ -1,4 +1,5 @@
-"""FastAPI 入口：/api/solve 与 /api/analyze-outages 负责校验与求解，其余路径提供原生前端静态页面。"""
+"""FastAPI 入口：/api/solve、/api/analyze-outages、/api/locate-leak、
+/api/restore-supply 负责校验与求解，其余路径提供原生前端静态页面。"""
 
 from __future__ import annotations
 
@@ -15,9 +16,11 @@ from .solver import (
     ValidationError,
     analyze_pipe_outages,
     locate_single_leak,
+    plan_supply_restoration,
     solve_network,
     validate_leak_payload,
     validate_payload,
+    validate_restore_payload,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -108,6 +111,26 @@ async def locate_leak(request: Request) -> JSONResponse:
                             content={"ok": False, "error": str(exc)})
 
     return JSONResponse(content={"ok": True, "leak_analysis": analysis})
+
+
+@app.post("/api/restore-supply")
+async def restore_supply(request: Request) -> JSONResponse:
+    """停供节点分组复供规划：基线（停供按零需水）+ 枚举全部复供组合（含空集）。"""
+    payload, bad = await _load_payload(request)
+    if bad is not None:
+        return bad
+
+    try:
+        case = validate_restore_payload(payload)
+        analysis = plan_supply_restoration(case)
+    except ValidationError as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+    except SolverNotConverged as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+
+    return JSONResponse(content={"ok": True, "restoration": analysis})
 
 
 # 静态资源（index.html / style.css / app.js）——该路由必须最后注册
