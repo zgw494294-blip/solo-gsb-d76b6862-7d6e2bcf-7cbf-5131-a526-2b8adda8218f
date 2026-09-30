@@ -82,6 +82,7 @@ H_i − H_j = r_p · q_p · |q_p|
 | `POST` | `/api/solve` | 入参 `{nodes, pipes, min_head}`，返回水头、流量、流向、供水量与各项残差；非法输入返回 `422`/`400` 与中文原因 |
 | `POST` | `/api/analyze-outages` | 入参与 `/api/solve` 相同；先求基线，再对每根管段各评估一个“单独停用”情景并按风险排序返回 |
 | `POST` | `/api/locate-leak` | 入参为管网参数 + `measurements`（2～8 个互异用水节点的实测水头）+ 正的 `leak_upper_bound`；逐用水节点拟合单点漏量并按测点误差排序 |
+| `POST` | `/api/plan-resupply` | 入参为管网参数 + `resupply_nodes`（2～6 个互异、表内需水量为正的用水节点）；先求停供基线，再枚举包含空集在内的全部复供组合，返回恢复需水量总量最大的可行组合 |
 | `GET` | `/api/health` | 健康检查 |
 
 请求示例：
@@ -249,6 +250,129 @@ curl -s http://localhost:8000/api/locate-leak \
 非法输入（测点数不在 2～8、测点重复或不是用水节点、实测水头/上限非有限值、上限非正、
 原有管网校验未通过等）返回 `422`/`400` 并附中文原因。
 
+### 停供节点同时复供组合优选 `POST /api/plan-resupply`
+
+> 复供优选与求解共用同一服务、同一端口，**不需要任何额外服务或新的启动步骤**——
+> `docker compose up --build` 后即可直接调用。
+
+在管网参数（与 `/api/solve` 完全一致，沿用同一套输入校验）之外，请求体还需包含：
+
+- `resupply_nodes`：**2～6 个互异**的候选停供节点编号，必须**全部为表内需水量为正**
+  的用水节点（不能是水源，也不能是零需水节点）；候选的处理顺序一律按**节点录入顺序**，
+  与数组书写顺序无关。
+
+后端把这些候选节点视为**当前停供**：
+
+1. **先求复供前基线（空集）**：所有候选节点按**零需水**计算，其他节点（含非候选用水
+   节点）保持表内需水量不变；基线若有用水节点水头低于当前最低水头限值，则现有管网在
+   复供前即**欠压**，`status: "baseline_below_limit"`，**无法复供**（不再评估其他组合）。
+2. 基线合格时，再核对包含空集在内的 **2^k 个组合**：每个组合中被选中的候选**恢复表内
+   需水量**，未选中的候选继续按零需水；每个组合都独立做稳态求解。只有**稳态收敛且所有
+   用水节点水头均不低于最低水头限值**的组合才标记为 `feasible`（可选）。
+3. 在所有可行组合中，选**恢复需水量总和最大**者；**总量相同先选节点更多的，再按节点
+   录入顺序的字典序选**（例：总量同为 4 时 `{A,B}` 胜 `{C}`，`{A,B}` 胜 `{A,C}`）。
+4. **求解失败绝不按欠压处理**：基线不收敛时 `status: "baseline_not_converged"`、
+   `baseline` 为 `null`，无法确认最优；任一非空组合不收敛时
+   `status: "not_confirmed"`，该组合记为 `not_converged`（不计入欠压数）并排最后，
+   其余组合照常评估，响应同时给出当前已确认可行组合中的**临时最优**
+   （`selected_provisional: true`），并在 `conclusion` 中说明该结果可能被未求解的
+   组合超越。
+
+响应 `resupply_analysis` 含：
+
+- `status`：`optimal`（全部组合收敛且最优已确认）/ `baseline_below_limit`（基线欠压，
+  无法复供）/ `baseline_not_converged`（基线不收敛）/ `not_confirmed`（部分组合不收敛，
+  无法确认最优）之一；`optimal_confirmed` 仅在 `optimal` 时为 `true`；
+- `baseline`：复供前基线的完整稳态解（结构与 `/api/solve` 的 `result` 相同；
+  基线不收敛时为 `null`，原因在 `baseline_error`），`baseline_below_min_head` 为基线
+  低于限值的用水节点；
+- `combinations`：全部 2^k 个组合（空集排第一参与枚举），按“可行→欠压→不收敛”分组、
+  组内按上述优选规则排序并带 `rank`：
+  - `feasible`：`nodes`（复供节点，按节点录入顺序）、`node_count`、`restored_demand`
+    （恢复需水量总和）、`min_demand_head` / `min_demand_head_node`、
+    `below_min_head: []` 与该组合的完整 `solution`；
+  - `below_limit`：稳态收敛但有用水节点低于限值，含 `below_min_head`，**不可选**；
+  - `not_converged`：含 `error`（中文原因），单独排最后，**不计为欠压**；
+- `selected`：最优（或临时最优）组合记录；`restored_demand_total` 为恢复总量；
+  `unrestored_nodes` 为仍按零需水、**未复供**的候选节点；
+- `table_demands` / `table_demand_total`：候选节点的表内需水量与总和；
+  `counts` 给出三类组合数量；`conclusion` 为中文结论。
+
+curl 调用示例（树状网 S–A–B–C，候选 A/B/C 表内需水均为 2，限值 9）：
+
+```bash
+curl -s http://localhost:8000/api/plan-resupply \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "min_head": 9,
+    "nodes": [
+      {"id": "S", "type": "source", "head": 30.0},
+      {"id": "A", "type": "demand", "demand": 2.0},
+      {"id": "B", "type": "demand", "demand": 2.0},
+      {"id": "C", "type": "demand", "demand": 2.0}
+    ],
+    "pipes": [
+      {"id": "P1", "start": "S", "end": "A", "r": 1.0},
+      {"id": "P2", "start": "A", "end": "B", "r": 1.0},
+      {"id": "P3", "start": "B", "end": "C", "r": 1.0}
+    ],
+    "resupply_nodes": ["A", "B", "C"]
+  }'
+```
+
+返回（节选）：复供前基线 A/B/C 全停（按零需水），各点水头均为 30；三节点同时复供会让
+末端水头跌到 −26，`{A,C}`、`{B,C}` 也分别因 C、B/C 欠压不可选；可行组合中
+`{A,B}` 恢复总量 4 最大（此时 H_A=14、H_B=H_C=10 均不低于限值 9），C 未复供：
+
+```json
+{
+  "ok": true,
+  "resupply_analysis": {
+    "status": "optimal",
+    "optimal_confirmed": true,
+    "min_head": 9.0,
+    "resupply_nodes": ["A", "B", "C"],
+    "table_demands": {"A": 2.0, "B": 2.0, "C": 2.0},
+    "table_demand_total": 6.0,
+    "evaluated_combinations": 8,
+    "total_combinations": 8,
+    "baseline_below_min_head": [],
+    "counts": {"feasible": 5, "below_limit": 3, "not_converged": 0},
+    "selected": {
+      "rank": 1,
+      "status": "feasible",
+      "nodes": ["A", "B"],
+      "node_count": 2,
+      "restored_demand": 4.0,
+      "min_demand_head": 10.0,
+      "min_demand_head_node": "B",
+      "below_min_head": []
+    },
+    "restored_demand_total": 4.0,
+    "unrestored_nodes": ["C"],
+    "failed_combinations": [],
+    "conclusion": "全部 8 个组合均已稳态收敛；在所有用水节点水头均不低于最低水头限值 9 的可行组合中，恢复需水量总和最大的组合为 {A、B}，恢复总量 4。"
+  }
+}
+```
+
+全部 8 个组合（节选，`feasible` 在前、`below_limit` 在后）：
+
+| rank | 组合 | 状态 | 恢复总量 | 最低用水节点水头 | 低于限值节点 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `{A,B}` | feasible | 4 | 10（B） | — |
+| 2 | `{A}` | feasible | 2 | 26（A） | — |
+| 3 | `{B}` | feasible | 2 | 22（B） | — |
+| 4 | `{C}` | feasible | 2 | 18（C） | — |
+| 5 | `{}`（基线/空集） | feasible | 0 | 30 | — |
+| 6 | `{A,B,C}` | below_limit | 6 | −26（C） | A、B、C |
+| 7 | `{A,C}` | below_limit | 4 | 6（C） | C |
+| 8 | `{B,C}` | below_limit | 4 | −6（C） | B、C |
+
+非法输入（候选数不在 2～6、候选重复、不是用水节点或为水源、表内需水量非正、
+`resupply_nodes` 不是数组、原有管网校验未通过等）返回 `422`/`400` 并附中文原因；
+基线欠压与“无法确认最优”属于业务结论，HTTP 状态码仍为 `200`，请依据 `status` 字段区分。
+
 ## 输入约束汇总
 
 - 节点 2～10 个，编号为非空且唯一的字符串；
@@ -258,19 +382,21 @@ curl -s http://localhost:8000/api/locate-leak \
 - 不接受 `NaN` / `Infinity`（含 JSON 文本中的 `NaN`/`Infinity` 记号）；
 - 仅 `/api/locate-leak` 额外要求：`measurements` 为 2～8 个测点，节点编号互异且均为
   用水节点，实测水头为有限数值；`leak_upper_bound` 为正有限数。
+- 仅 `/api/plan-resupply` 额外要求：`resupply_nodes` 为 2～6 个互异节点编号，均为
+  表内需水量为正的用水节点（不能是水源或零需水节点）；候选顺序按节点录入顺序归并。
 
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py            # FastAPI 入口：/api/solve、/api/analyze-outages、/api/locate-leak、/api/health、静态页面
-│   ├── solver.py          # 输入校验 + Newton 稳态求解 + 1e-6 复核 + 逐根停管情景分析 + 单点漏损定位（黄金分割）
+│   ├── main.py            # FastAPI 入口：/api/solve、/api/analyze-outages、/api/locate-leak、/api/plan-resupply、/api/health、静态页面
+│   ├── solver.py          # 输入校验 + Newton 稳态求解 + 1e-6 复核 + 逐根停管情景分析 + 单点漏损定位（黄金分割）+ 停供节点复供组合枚举
 │   └── static/
 │       ├── index.html     # 原生页面（含停管分析入口与结果表）
 │       ├── style.css
 │       └── app.js         # 可编辑表格、力图布局、拖拽、流向绘制、停管分析
-├── tests/test_solver.py   # pytest：解析解、环状网、校验分支、API、随机压力测试、停管分析排序
+├── tests/test_solver.py   # pytest：解析解、环状网、校验分支、API、随机压力测试、停管分析排序、漏损定位、复供组合优选
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -283,4 +409,4 @@ pip install -r requirements.txt pytest httpx
 PYTHONPATH=. pytest -q
 ```
 
-测试包含单管解析解、反向录入符号、环状网独立复核、低水头标记、各类非法输入、`NaN` JSON 拒绝，以及 60 个随机连通管网（2～10 节点、最多 16 管、阻力跨 6 个数量级）的收敛性与残差检查；停管分析部分覆盖树状网全断联按失供量排序、环+枝混合分组排序、比基线新增低水头节点、同分保持录入顺序、单情景不收敛单独排最后，以及 `/api/analyze-outages` 的 200/422/400 分支；漏损定位部分覆盖真值漏点与漏量回收、无漏损基线 RMSE=0 不判漏、对称网络多候选无法区分、最优漏量落在上限端点、测点/上限各类非法输入、基线不收敛整体报错、单候选失败隔离排最后，以及 `/api/locate-leak` 的 200/422/400 分支。
+测试包含单管解析解、反向录入符号、环状网独立复核、低水头标记、各类非法输入、`NaN` JSON 拒绝，以及 60 个随机连通管网（2～10 节点、最多 16 管、阻力跨 6 个数量级）的收敛性与残差检查；停管分析部分覆盖树状网全断联按失供量排序、环+枝混合分组排序、比基线新增低水头节点、同分保持录入顺序、单情景不收敛单独排最后，以及 `/api/analyze-outages` 的 200/422/400 分支；漏损定位部分覆盖真值漏点与漏量回收、无漏损基线 RMSE=0 不判漏、对称网络多候选无法区分、最优漏量落在上限端点、测点/上限各类非法输入、基线不收敛整体报错、单候选失败隔离排最后，以及 `/api/locate-leak` 的 200/422/400 分支；复供优选部分覆盖可行组合按恢复总量排序、总量同分先比节点数再按录入顺序字典序、空集最优、基线欠压无法复供、非候选节点需水不变、基线不收敛与单组合不收敛的“无法确认最优”区分（求解失败不计欠压）、候选 2～6 个/互异/正需水等校验分支，以及 `/api/plan-resupply` 的 200/422/400 分支。

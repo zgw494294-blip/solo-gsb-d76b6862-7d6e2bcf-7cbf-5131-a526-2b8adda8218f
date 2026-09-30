@@ -15,9 +15,11 @@ from .solver import (
     ValidationError,
     analyze_pipe_outages,
     locate_single_leak,
+    plan_resupply,
     solve_network,
     validate_leak_payload,
     validate_payload,
+    validate_resupply_payload,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -108,6 +110,26 @@ async def locate_leak(request: Request) -> JSONResponse:
                             content={"ok": False, "error": str(exc)})
 
     return JSONResponse(content={"ok": True, "leak_analysis": analysis})
+
+
+@app.post("/api/plan-resupply")
+async def plan_resupply_endpoint(request: Request) -> JSONResponse:
+    """停供节点同时复供组合优选：先求复供前基线，再核对包含空集在内的全部组合。"""
+    payload, bad = await _load_payload(request)
+    if bad is not None:
+        return bad
+
+    try:
+        case = validate_resupply_payload(payload)
+        analysis = plan_resupply(case)
+    except ValidationError as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+    except SolverNotConverged as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+
+    return JSONResponse(content={"ok": True, "resupply_analysis": analysis})
 
 
 # 静态资源（index.html / style.css / app.js）——该路由必须最后注册

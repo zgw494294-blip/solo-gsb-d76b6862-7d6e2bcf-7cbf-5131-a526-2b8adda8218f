@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
+from functools import cmp_to_key
 from typing import Any
 
 import numpy as np
@@ -832,5 +833,315 @@ def locate_single_leak(case: LeakCase) -> dict[str, Any]:
         "indistinguishable_nodes": indistinguishable_nodes,
         "leak_detected": leak_detected,
         "leak_node": leak_node,
+        "conclusion": conclusion,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 停供节点同时复供组合优选
+# --------------------------------------------------------------------------- #
+MIN_RESUPPLY_NODES, MAX_RESUPPLY_NODES = 2, 6
+# 恢复总量“相同”的归并容差：差值不超过该绝对容差即视为同分，转入节点数/字典序比较
+RESUPPLY_TOTAL_TIE_TOL = 1.0e-9
+
+
+@dataclass(frozen=True)
+class ResupplyCase:
+    """一次停供节点复供优选的全部输入。"""
+    network: Network
+    # 候选停供节点编号（表内需水量为正的用水节点），按节点录入顺序
+    resupply_nodes: list[str]
+
+
+def validate_resupply_payload(payload: Any) -> ResupplyCase:
+    """在管网校验的基础上追加校验复供候选节点，返回规范化 ResupplyCase。"""
+    net = validate_payload(payload)
+    demand_map = {n["id"]: n for n in net.nodes if n["type"] == "demand"}
+
+    raw_nodes = payload.get("resupply_nodes")
+    if not isinstance(raw_nodes, list):
+        raise ValidationError("resupply_nodes 必须是候选停供节点编号数组。")
+    if not (MIN_RESUPPLY_NODES <= len(raw_nodes) <= MAX_RESUPPLY_NODES):
+        raise ValidationError(
+            f"候选停供节点必须在 {MIN_RESUPPLY_NODES}～{MAX_RESUPPLY_NODES} 个之间，"
+            f"当前为 {len(raw_nodes)} 个。")
+
+    seen: set[str] = set()
+    for k, raw in enumerate(raw_nodes, start=1):
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValidationError(f"第 {k} 个候选停供节点缺少有效的节点编号（非空字符串）。")
+        nid = raw.strip()
+        if nid not in demand_map:
+            raise ValidationError(
+                f"候选停供节点“{nid}”不是已定义的用水节点"
+                "（候选必须全部为用水节点，且不能是水源）。")
+        if demand_map[nid]["demand"] <= 0.0:
+            raise ValidationError(
+                f"候选停供节点“{nid}”的表内需水量必须为正数，当前为 "
+                f"{demand_map[nid]['demand']:g}。")
+        if nid in seen:
+            raise ValidationError(
+                f"候选停供节点“{nid}”重复，候选节点必须互异。")
+        seen.add(nid)
+
+    # 候选在组合枚举中的顺序一律按节点录入顺序，而非请求数组顺序
+    entry_order = [n["id"] for n in net.nodes if n["id"] in seen]
+    return ResupplyCase(network=net, resupply_nodes=entry_order)
+
+
+def _network_for_combo(net: Network, candidate_set: set[str],
+                       restored: set[str]) -> Network:
+    """构造某一复供组合对应的情景网络。
+
+    候选节点（candidate_set 内）：在 restored 中则恢复表内需水量，否则置零；
+    其他节点（含零需水用水节点与水源）：保持原样。
+    """
+    nodes: list[dict[str, Any]] = []
+    for node in net.nodes:
+        if node["type"] == "demand" and node["id"] in candidate_set \
+                and node["id"] not in restored:
+            stopped = dict(node)
+            stopped["demand"] = 0.0
+            nodes.append(stopped)
+        else:
+            nodes.append(node)
+    return Network(nodes=nodes, pipes=net.pipes, min_head=net.min_head)
+
+
+def _combo_solution_record(mask: int, candidates: list[str],
+                           table_demands: dict[str, float],
+                           result: dict[str, Any]) -> dict[str, Any]:
+    """把一次成功求解的组合结果组装成对外的情景记录。"""
+    ids = [candidates[b] for b in range(len(candidates)) if mask & (1 << b)]
+    restored_total = float(sum(table_demands[nid] for nid in ids))
+    # node_results 保持录入顺序，用水节点最小水头并列时取录入顺序最早者
+    demand_rows = [n for n in result["node_results"] if n["type"] == "demand"]
+    min_node = min(demand_rows, key=lambda row: row["head"])
+    below = [n["id"] for n in demand_rows if n["below_min_head"]]
+    feasible = not below
+    return {
+        "status": "feasible" if feasible else "below_limit",
+        "nodes": ids,
+        "node_count": len(ids),
+        "restored_demand": restored_total,
+        "min_demand_head": float(min_node["head"]),
+        "min_demand_head_node": min_node["id"],
+        "below_min_head": below,
+        "solution": result,
+    }
+
+
+def plan_resupply(case: ResupplyCase) -> dict[str, Any]:
+    """在现有管网上选择一组可同时复供的停供节点。
+
+    候选节点在复供前一律按零需水计算（基线 = 空集情景），选中后才恢复表内需水量，
+    其他节点不变。对包含空集在内的全部 2^k 个组合逐一做稳态求解：
+
+      * 基线（空集）不收敛            -> status=baseline_not_converged，无法确认最优；
+      * 基线收敛但有用水节点水头低于限值 -> status=baseline_below_limit，无法复供；
+      * 其余任一组合不收敛             -> status=not_confirmed，无法确认最优
+                                         （求解失败绝不按欠压处理），同时给出当前
+                                         已确认可行组合中的临时最优；
+      * 全部组合完成求解               -> status=optimal，返回可行组合中恢复需水量
+                                         总和最大者；总量相同先取节点更多者，再按
+                                         节点录入顺序的字典序取。
+    """
+    net = case.network
+    candidates = list(case.resupply_nodes)
+    k = len(candidates)
+    cand_set = set(candidates)
+    table_demands = {n["id"]: float(n["demand"])
+                     for n in net.nodes if n["id"] in cand_set}
+    demand_ids_in_order = [n["id"] for n in net.nodes if n["type"] == "demand"]
+
+    def demand_heads_ok(result: dict[str, Any]) -> list[str]:
+        """返回该解中水头低于限值的用水节点（按录入顺序），空列表即全部合格。"""
+        return [nid for nid in demand_ids_in_order
+                if result["heads"][nid] < net.min_head]
+
+    # ---- 第 1 步：复供前基线（空集：所有候选按零需水） ---------------------
+    baseline_net = _network_for_combo(net, cand_set, set())
+    try:
+        baseline = solve_network(baseline_net)
+    except SolverNotConverged as exc:
+        return {
+            "status": "baseline_not_converged",
+            "optimal_confirmed": False,
+            "min_head": net.min_head,
+            "resupply_nodes": candidates,
+            "table_demands": {nid: table_demands[nid] for nid in candidates},
+            "table_demand_total": float(sum(table_demands.values())),
+            "evaluated_combinations": 0,
+            "total_combinations": 1 << k,
+            "baseline": None,
+            "baseline_error": str(exc),
+            "baseline_below_min_head": [],
+            "combinations": [],
+            "counts": {"feasible": 0, "below_limit": 0, "not_converged": 0},
+            "selected": None,
+            "selected_provisional": False,
+            "restored_demand_total": None,
+            "unrestored_nodes": list(candidates),
+            "failed_combinations": [{
+                "status": "not_converged",
+                "nodes": [],
+                "node_count": 0,
+                "restored_demand": 0.0,
+                "error": str(exc),
+            }],
+            "conclusion": (
+                "复供前基线（全部候选停供、按零需水计算）的稳态求解未能收敛，"
+                "无法确认最优复供组合（不能把求解失败当作欠压）。"),
+        }
+
+    baseline_below = demand_heads_ok(baseline)
+    base_record = _combo_solution_record(0, candidates, table_demands, baseline)
+    # 基线（空集）必然连通，head 限值判定以全部用水节点为准
+    if baseline_below:
+        base_record["status"] = "below_limit"
+        base_record["below_min_head"] = baseline_below
+        base_record["rank"] = 1
+        conclusion = (
+            "复供前基线（候选停供节点均按零需水计算）中，用水节点 "
+            + "、".join(baseline_below)
+            + " 的水头已低于最低水头限值 "
+            f"{net.min_head:g}，现有管网在复供前即欠压，任何复供组合都不可选，"
+            "无法复供。")
+        return {
+            "status": "baseline_below_limit",
+            "optimal_confirmed": False,
+            "min_head": net.min_head,
+            "resupply_nodes": candidates,
+            "table_demands": {nid: table_demands[nid] for nid in candidates},
+            "table_demand_total": float(sum(table_demands.values())),
+            "evaluated_combinations": 1,
+            "total_combinations": 1 << k,
+            "baseline": baseline,
+            "baseline_below_min_head": baseline_below,
+            "combinations": [base_record],
+            "counts": {"feasible": 0, "below_limit": 1, "not_converged": 0},
+            "selected": None,
+            "selected_provisional": False,
+            "restored_demand_total": None,
+            "unrestored_nodes": list(candidates),
+            "failed_combinations": [],
+            "conclusion": conclusion,
+        }
+    base_record["status"] = "feasible"
+
+    # ---- 第 2 步：枚举全部非空组合并逐一稳态求解 ---------------------------
+    def combo_ids(mask: int) -> list[str]:
+        return [candidates[b] for b in range(k) if mask & (1 << b)]
+
+    feasible_combos: list[dict[str, Any]] = [base_record]
+    below_combos: list[dict[str, Any]] = []
+    failed_combos: list[dict[str, Any]] = []
+
+    for mask in range(1, 1 << k):
+        ids = combo_ids(mask)
+        restored_total = float(sum(table_demands[nid] for nid in ids))
+        combo_net = _network_for_combo(net, cand_set, set(ids))
+        try:
+            result = solve_network(combo_net)
+        except SolverNotConverged as exc:
+            failed_combos.append({
+                "status": "not_converged",
+                "nodes": ids,
+                "node_count": len(ids),
+                "restored_demand": restored_total,
+                "error": str(exc),
+            })
+            continue
+        record = _combo_solution_record(mask, candidates, table_demands, result)
+        if record["status"] == "feasible":
+            feasible_combos.append(record)
+        else:
+            below_combos.append(record)
+
+    # ---- 第 3 步：组合排序 -------------------------------------------------
+    # 恢复总量降序（1e-9 容差归并同分）→ 节点数降序 → 按录入顺序的字典序
+    def cmp_combo(a: dict[str, Any], b: dict[str, Any]) -> int:
+        delta = float(b["restored_demand"]) - float(a["restored_demand"])
+        if delta > RESUPPLY_TOTAL_TIE_TOL:
+            return 1
+        if delta < -RESUPPLY_TOTAL_TIE_TOL:
+            return -1
+        if a["node_count"] != b["node_count"]:
+            return -1 if a["node_count"] > b["node_count"] else 1
+        ia = tuple(candidates.index(nid) for nid in a["nodes"])
+        ib = tuple(candidates.index(nid) for nid in b["nodes"])
+        return -1 if ia < ib else (1 if ia > ib else 0)
+
+    feasible_combos.sort(key=cmp_to_key(cmp_combo))
+    below_combos.sort(key=cmp_to_key(cmp_combo))
+    failed_combos.sort(key=cmp_to_key(cmp_combo))
+
+    all_combos = feasible_combos + below_combos + failed_combos
+    for rank, rec in enumerate(all_combos, start=1):
+        rec["rank"] = rank
+
+    best = feasible_combos[0] if feasible_combos else None
+    counts = {
+        "feasible": len(feasible_combos),
+        "below_limit": len(below_combos),
+        "not_converged": len(failed_combos),
+    }
+
+    if failed_combos:
+        status = "not_confirmed"
+        optimal_confirmed = False
+        selected_provisional = best is not None
+        failed_desc = "、".join("{" + "、".join(rec["nodes"]) + "}"
+                               for rec in failed_combos)
+        if best is None:
+            conclusion = (
+                f"共有 {len(failed_combos)} 个复供组合（{failed_desc}）的稳态求解"
+                "未能收敛，且没有任何组合被确认可行；无法确认最优复供组合"
+                "（不能把求解失败当作欠压）。")
+        else:
+            nodes_desc = "、".join(best["nodes"])
+            conclusion = (
+                f"共有 {len(failed_combos)} 个复供组合（{failed_desc}）的稳态求解"
+                "未能收敛，无法在全部组合上确认最优（不能把求解失败当作欠压）；"
+                f"当前已确认可行组合中的临时最优为 {{{nodes_desc}}}，"
+                f"恢复需水量总和 {best['restored_demand']:g}，"
+                "但该结果可能被未能求解的组合超越。")
+    else:
+        status = "optimal"
+        optimal_confirmed = True
+        selected_provisional = False
+        assert best is not None  # 基线已可行，空集至少是一个可行组合
+        if best["node_count"] == 0:
+            conclusion = (
+                f"全部 {len(all_combos)} 个组合均已稳态求解；除空集外没有任何复供"
+                "组合能使所有用水节点水头不低于限值，最优组合为空集（不恢复任何"
+                "停供节点），恢复需水量总和为 0。")
+        else:
+            conclusion = (
+                f"全部 {len(all_combos)} 个组合均已稳态收敛；在所有用水节点水头"
+                f"均不低于最低水头限值 {net.min_head:g} 的可行组合中，恢复需水量"
+                f"总和最大的组合为 {{{'、'.join(best['nodes'])}}}，恢复总量 "
+                f"{best['restored_demand']:g}。")
+
+    selected_ids = best["nodes"] if best is not None else []
+    return {
+        "status": status,
+        "optimal_confirmed": optimal_confirmed,
+        "min_head": net.min_head,
+        "resupply_nodes": candidates,
+        "table_demands": {nid: table_demands[nid] for nid in candidates},
+        "table_demand_total": float(sum(table_demands.values())),
+        "evaluated_combinations": len(all_combos),
+        "total_combinations": 1 << k,
+        "baseline": baseline,
+        "baseline_below_min_head": baseline_below,
+        "combinations": all_combos,
+        "counts": counts,
+        "selected": best,
+        "selected_provisional": selected_provisional,
+        "restored_demand_total": (None if best is None
+                                 else float(best["restored_demand"])),
+        "unrestored_nodes": [nid for nid in candidates if nid not in selected_ids],
+        "failed_combinations": failed_combos,
         "conclusion": conclusion,
     }
